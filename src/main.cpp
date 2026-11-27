@@ -7,7 +7,7 @@
 
 using namespace batchd;
 
-static const char* VERSION = "1.0.0";
+static const char* VERSION = "1.1.0";
 
 static void usage() {
     printf("batchd %s - continuous batching for llm inference\n", VERSION);
@@ -15,6 +15,7 @@ static void usage() {
     printf("  batchd demo [--max-batch-tokens N] [--max-blocks N]\n");
     printf("  batchd bench [--seqs N] [--prompt N] [--max-tokens N]\n");
     printf("               [--max-batch-tokens N] [--max-blocks N] [--seed N]\n");
+    printf("               [--shared-prefix N]\n");
     printf("  batchd verify\n");
     printf("  batchd --version\n");
 }
@@ -36,6 +37,9 @@ static void print_metrics(const Scheduler& sch) {
     printf("mean ttft: %.2f steps, mean tpot: %.2f steps/token\n", m.mean_ttft,
            m.mean_tpot);
     printf("preemptions: %d, peak batch: %d\n", m.preemptions, m.peak_running);
+    if (m.prefix_hits)
+        printf("prefix cache: %d hits, %d prompt tokens skipped\n",
+               m.prefix_hits, m.prefix_tokens_saved);
 }
 
 static int demo(int argc, char** argv) {
@@ -45,17 +49,24 @@ static int demo(int argc, char** argv) {
     cfg.max_seqs = 4;
     cfg.block_size = 16;
     Scheduler sch(cfg);
-    int prompts[] = {8, 40, 128, 16, 64, 200};
+    int prompts[] = {64, 96, 128, 8, 64, 200};
     int maxtok[] = {8, 12, 10, 24, 16, 6};
-    for (int i = 0; i < 6; i++) sch.submit(prompts[i], maxtok[i]);
+    // the first three share a 48-token system prompt, #5 and #6 share
+    // a 32-token one, #4 shares nothing. shared blocks allocate once.
+    int prefix[] = {48, 48, 48, 0, 32, 32};
+    uint64_t pid[] = {1, 1, 1, 0, 2, 2};
+    for (int i = 0; i < 6; i++)
+        sch.submit(prompts[i], maxtok[i], prefix[i], pid[i]);
     printf("step  running (prefilled/prompt, generated)  blocks\n");
     while (!sch.finished()) {
         sch.step();
         printf("%4d  ", sch.step_count() - 1);
         for (const auto& s : sch.sequences()) {
             if (s.done) continue;
-            printf("#%llu %d/%d,%d  ", (unsigned long long)s.id, s.prefilled,
+            printf("#%llu %d/%d,%d", (unsigned long long)s.id, s.prefilled,
                    s.prompt_len, s.generated);
+            if (s.shared_blocks) printf("+%dsh", s.shared_blocks);
+            printf("  ");
         }
         printf(" %d/%d\n", sch.used_blocks(), cfg.max_blocks);
     }
@@ -68,6 +79,7 @@ static int bench(int argc, char** argv) {
     int nseqs = flag_val(argc, argv, "--seqs", 64);
     int prompt = flag_val(argc, argv, "--prompt", 128);
     int seed = flag_val(argc, argv, "--seed", 7);
+    int shared = flag_val(argc, argv, "--shared-prefix", 0);
     Config cfg;
     cfg.max_batch_tokens = flag_val(argc, argv, "--max-batch-tokens", 512);
     cfg.max_blocks = flag_val(argc, argv, "--max-blocks", 1024);
@@ -82,7 +94,10 @@ static int bench(int argc, char** argv) {
         state = state * 1664525u + 1013904223u;
         int len = prompt / 2 + (int)(state % (unsigned)prompt);
         if (len < 1) len = 1;
-        sch.submit(len);
+        // --shared-prefix N: groups of four share the first N tokens
+        // of their prompt, like a common system prompt.
+        uint64_t pid = shared > 0 ? (uint64_t)(i / 4 + 1) : 0;
+        sch.submit(len, -1, shared, pid);
     }
     auto t0 = std::chrono::steady_clock::now();
     sch.run();
@@ -119,6 +134,21 @@ static int verify() {
     }
     for (const auto& s : sch.sequences()) {
         if (!s.done || s.generated < 1) ok = false;
+    }
+    // shared prefix workload: two seqs with the same 32-token start
+    // should share blocks and skip computing the prefix twice.
+    {
+        Config pcfg;
+        pcfg.max_batch_tokens = 512;
+        Scheduler psch(pcfg);
+        psch.submit(64, 4, 32, 7);
+        psch.submit(64, 4, 32, 7);
+        psch.run();
+        if (!psch.finished()) ok = false;
+        if (psch.metrics().prefix_hits != 1) ok = false;
+        if (psch.metrics().prefix_tokens_saved != 32) ok = false;
+        if (psch.metrics().prefill_tokens != 96) ok = false;
+        if (psch.used_blocks() != 0) ok = false;
     }
     printf("verify: %s (%d steps, %d preemptions)\n", ok ? "ok" : "FAILED",
            sch.step_count(), sch.metrics().preemptions);
