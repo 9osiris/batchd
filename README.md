@@ -41,6 +41,7 @@ watch a small workload step by step:
 bench a bigger workload:
   ./batchd bench --seqs 64 --prompt 128
   ./batchd bench --seqs 64 --prompt 128 --max-batch-tokens 128 --max-blocks 64
+  ./batchd bench --seqs 64 --prompt 128 --shared-prefix 64
 
 check the invariants on a fixed workload:
   ./batchd verify
@@ -48,8 +49,11 @@ check the invariants on a fixed workload:
 flags:
   demo takes --max-batch-tokens and --max-blocks.
   bench takes --seqs, --prompt, --max-tokens, --max-batch-tokens,
-  --max-blocks, --seed. prompt lengths jitter around the base so the
-  batch is uneven, like real traffic, and stay deterministic per seed.
+  --max-blocks, --seed, --shared-prefix. prompt lengths jitter around
+  the base so the batch is uneven, like real traffic, and stay
+  deterministic per seed. --shared-prefix N makes groups of four
+  share the first N tokens of their prompt, like a common system
+  prompt, so bench shows what prefix caching is worth.
 
 how it works:
   a step has a token budget. waiting sequences get admitted while the
@@ -67,7 +71,24 @@ how it works:
   budget smaller than the longest prompt, or blocks too small to hold
   one prompt) stops instead of spinning forever.
 
+prefix sharing:
+  sequences that start with the same prompt (a system prompt, a
+  few-shot header) can share the kv blocks for that start instead of
+  each allocating their own. submit takes a prefix length and a
+  prefix id, sequences with the same id share the first prefix_len
+  tokens. only whole blocks are shared, the tail of a prefix that
+  does not fill a block stays private, and the same id with a
+  different length is a different prefix. the first sequence to
+  prefill past the shared part registers those blocks in a cache,
+  later sequences with the same id attach to it, skip computing the
+  shared tokens, and hold the blocks by refcount. the entry frees
+  when the last sequence lets go, either by finishing or by being
+  preempted. a preempted sequence drops its hold and re-attaches
+  when it is admitted again, if the entry is still alive. a sequence
+  whose whole prompt is shared gets its first token without any
+  prefill compute. bench --shared-prefix 64 on 64 seqs skips 3072
+  prompt tokens (4832 computed instead of 7904) with 48 cache hits.
+
 follow-ups:
-  prefix block sharing between sequences with the same prompt start,
   decode-priority scheduling so a big prefill cant starve decode,
   priority lanes for short prompts.
