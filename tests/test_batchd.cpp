@@ -227,6 +227,140 @@ int main() {
               "run stops at the cap on a stuck config");
     }
 
+    // shared prefix: two seqs with the same 32-token system prompt
+    // share 2 blocks. second seq skips computing the shared tokens.
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        Scheduler sch(cfg);
+        uint64_t a = sch.submit(64, 4, 32, 7);
+        uint64_t b = sch.submit(64, 4, 32, 7);
+        sch.step();
+        const Sequence* sa = find(sch, a);
+        const Sequence* sb = find(sch, b);
+        check(sa->prefilled == 64 && sb->prefilled == 64,
+              "shared prefix both seqs fully prefilled on step 0");
+        check(sa->first_token_step == 0 && sb->first_token_step == 0,
+              "shared prefix both seqs emit first token on step 0");
+        check(sch.used_blocks() == 6,
+              "shared prefix uses 6 blocks, not 8");
+        check(sa->shared_blocks == 2 && sb->shared_blocks == 2,
+              "shared prefix each seq holds 2 shared blocks");
+        check(sch.metrics().prefix_hits == 1, "shared prefix one hit");
+        check(sch.metrics().prefix_tokens_saved == 32,
+              "shared prefix saves 32 prefill tokens");
+        check(sch.metrics().prefill_tokens == 96,
+              "shared prefix only computes 96 of 128 prompt tokens");
+        sch.run();
+        check(sch.used_blocks() == 0, "shared blocks freed after finish");
+    }
+
+    // prefix that does not fill a block: only whole blocks are shared
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        Scheduler sch(cfg);
+        sch.submit(64, 4, 40, 7);
+        sch.submit(64, 4, 40, 7);
+        sch.step();
+        check(sch.metrics().prefix_tokens_saved == 32,
+              "partial block prefix shares only 32 of 40 tokens");
+        check(sch.metrics().prefill_tokens == 96,
+              "partial block prefix computes the 8-token tail twice");
+    }
+
+    // different prefix ids never share, even with the same length
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        Scheduler sch(cfg);
+        sch.submit(64, 4, 32, 7);
+        sch.submit(64, 4, 32, 8);
+        sch.step();
+        check(sch.metrics().prefix_hits == 0, "different ids do not share");
+        check(sch.used_blocks() == 8, "different ids allocate 8 blocks");
+    }
+
+    // same id but different lengths are different prefixes: each
+    // registers its own entry, neither attaches to the other
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        Scheduler sch(cfg);
+        sch.submit(64, 4, 32, 7);
+        sch.submit(64, 4, 48, 7);
+        sch.step();
+        check(sch.metrics().prefix_hits == 0,
+              "same id different length does not share");
+        check(sch.used_blocks() == 8,
+              "same id different length allocates 8 blocks");
+    }
+
+    // prefix smaller than one block does not share at all
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        Scheduler sch(cfg);
+        sch.submit(32, 4, 8, 7);
+        sch.submit(32, 4, 8, 7);
+        sch.step();
+        check(sch.metrics().prefix_hits == 0, "sub-block prefix no share");
+        check(sch.metrics().prefill_tokens == 64,
+              "sub-block prefix computes both prompts fully");
+    }
+
+    // whole prompt shared: second seq gets its first token for free
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        Scheduler sch(cfg);
+        sch.submit(32, 4, 32, 9);
+        uint64_t b = sch.submit(32, 4, 32, 9);
+        sch.step();
+        check(find(sch, b)->first_token_step == 0,
+              "fully shared prompt emits first token on step 0");
+        check(sch.metrics().prefill_tokens == 32,
+              "fully shared prompt computes 32 tokens once");
+        check(sch.used_blocks() == 2, "fully shared prompt uses 2 blocks");
+    }
+
+    // prefix entry survives while one holder is still running: the
+    // first seq finishes early, the second keeps the shared blocks
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        Scheduler sch(cfg);
+        uint64_t a = sch.submit(64, 2, 32, 7);
+        uint64_t b = sch.submit(64, 8, 32, 7);
+        sch.step();
+        sch.step();
+        check(find(sch, a)->done, "short seq finishes on step 1");
+        check(sch.used_blocks() == 5,
+              "shared blocks stay live for the running seq");
+        check(!find(sch, b)->done, "long seq still running");
+        sch.run();
+        check(sch.used_blocks() == 0, "blocks freed when last holder ends");
+    }
+
+    // preemption with a shared prefix: the victim drops its hold,
+    // recomputes on re-admission, re-attaches, and still finishes
+    {
+        Config cfg;
+        cfg.max_batch_tokens = 512;
+        cfg.max_blocks = 6;
+        cfg.block_size = 16;
+        Scheduler sch(cfg);
+        sch.submit(64, 32, 32, 7);
+        sch.submit(64, 32, 32, 7);
+        sch.run();
+        check(sch.finished(), "shared prefix workload finishes under pressure");
+        check(sch.metrics().preemptions >= 1,
+              "shared prefix workload preempts at least once");
+        check(sch.metrics().prefix_hits >= 2,
+              "preempted seq re-attaches to the cached prefix");
+        check(sch.used_blocks() == 0, "blocks freed after preemption run");
+    }
+
     printf("%d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;
 }
